@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Điều khiển xe</title>
+<style>
+  body { font-family: sans-serif; text-align: center; margin-top: 40px; }
+  button { font-size: 22px; padding: 18px 36px; margin: 10px; border: 0;
+           border-radius: 10px; color: #fff; cursor: pointer; }
+  #btnNormal { background: #607d8b; }
+  #btnSearch { background: #1565c0; }
+  .active { outline: 4px solid #ffb300; }
+  #status { margin-top: 20px; font-size: 18px; }
+</style>
+</head>
+<body>
+  <h2>XE TỰ HÀNH</h2>
+  <button id="btnNormal">NORMAL</button>
+  <button id="btnSearch">SEARCHING</button>
+  <div id="status">Đang kết nối...</div>
+
+<script>
+  let ws;
+  const status = document.getElementById("status");
+  const bN = document.getElementById("btnNormal");
+  const bS = document.getElementById("btnSearch");
+
+  function connect() {
+    ws = new WebSocket("ws://" + location.host + "/ws");
+    ws.onopen  = () => status.textContent = "Đã kết nối";
+    ws.onclose = () => { status.textContent = "Mất kết nối, đang thử lại..."; setTimeout(connect, 1500); };
+    ws.onmessage = (e) => {
+      const searching = e.data === "MODE:SEARCHING";
+      bS.classList.toggle("active", searching);
+      bN.classList.toggle("active", !searching);
+      status.textContent = "Chế độ hiện tại: " + (searching ? "SEARCHING" : "NORMAL");
+    };
+  }
+  function send(msg) { if (ws && ws.readyState === 1) ws.send(msg); }
+
+  bN.onclick = () => send("NORMAL");
+  bS.onclick = () => send("SEARCHING");
+  connect();
+</script>
+</body>
+</html>
