@@ -1,0 +1,336 @@
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <Arduino.h>
+#include "FS.h"
+#include <LittleFS.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <ESPmDNS.h>
+
+// ====================== CONFIG ======================
+const char*    WIFI_SSID = "vivo Y35";
+const char*    WIFI_PASS = "ukelele@";
+const uint16_t UDP_PORT  = 4210;
+
+// --- GPIO pins (CHECK AGAINST YOUR ACTUAL WIRING DIAGRAM) ---
+// Single L298N: LEFT side = IN1/IN2, RIGHT side = IN3/IN4
+const int PIN_L1 = 27, PIN_L2 = 26;   // IN1, IN2 -> OUT1/OUT2 (left motors)
+const int PIN_R1 = 25, PIN_R2 = 33;   // IN3, IN4 -> OUT3/OUT4 (right motors)
+
+// Invert direction if a wheel spins backwards (1 or -1)
+const int LEFT_SIGN  = 1;
+const int RIGHT_SIGN = 1;
+
+// --- Target-following thresholds: must be calibrated on the real car ---
+const float DEADBAND       = 0.10;   // |err| below this = considered centered, drive straight
+const float PIVOT_ERR      = 0.45;   // |err| above this = pivot in place to realign
+const float NEAR_TURN_ERR  = 0.30;   // when standing close to the target, rotate if offset exceeds this
+const float STOP_AREA      = 0.25;   // area >= this = close enough -> stop
+const float RESUME_AREA    = 0.18;   // area < this (while stopped) = target moved away -> follow again
+const float SLOW_AREA_RATIO = 0.7;   // slow down when area >= STOP_AREA * this ratio
+
+// --- PWM speeds (0..255) ---
+const int BASE_SPEED   = 200;   // straight-driving speed
+const int SLOW_SPEED   = 150;   // speed when almost there
+const int STEER_GAIN   = 150;   // steering sharpness (larger = sharper turns)
+const int TURN_SPEED   = 190;   // pivot speed while following
+const int SEARCH_SPEED = 190;   // spin speed while searching for the target
+const int MIN_PWM      = 110;   // below this the motors lack torque to turn -> raised to this value
+
+// --- Timing (ms) ---
+const unsigned long SEARCH_PULSE_MS = 150;  // spin pulse length while searching
+const unsigned long SEARCH_PAUSE_MS = 350;  // pause between pulses so the camera can detect
+const unsigned long LOST_GRACE_MS   = 600;  // target lost longer than this -> go back to searching
+const unsigned long FRESH_MS        = 250;  // packets older than this are invalid -> stop the car
+
+// true: spin in place to search when no target is seen
+// false: stand still and wait when no target is seen
+const bool SEARCH_SPIN = true;
+const bool SEARCH_SPIN_RIGHT = true;  // initial search spin direction
+
+// ====================== GLOBAL VARIABLES ======================
+enum State { ST_SEARCH, ST_TRACK, ST_LOCKED };
+State state = ST_SEARCH;
+
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+volatile bool searchingEnabled = false;   // false = NORMAL, true = SEARCHING
+bool wasSearchingEnabled = false;
+
+WiFiUDP   udp;
+IPAddress remoteIP;
+uint16_t  remotePort = 0;
+
+bool  vDet = false;
+float vErr = 0, vArea = 0;
+float lastSeenErr = 0;                    // offset when the target was last seen
+unsigned long lastRx = 0, lastDetMs = 0;
+
+// Search-spin state (non-blocking)
+bool searchRight = SEARCH_SPIN_RIGHT;
+bool searchSpinning = false;
+unsigned long searchPhaseMs = 0;
+
+unsigned long lastStatusMs = 0;
+
+// ====================== UTILITIES ======================
+void sendMsg(const String& s) {
+  Serial.println(s);
+  if (remotePort) {
+    udp.beginPacket(remoteIP, remotePort);
+    udp.print(s);
+    udp.endPacket();
+  }
+}
+
+// ====================== MOTORS (PWM) ======================
+// speed: -255 (full reverse) .. 0 (stop) .. +255 (full forward)
+void setMotor(int a, int b, int speed) {
+  speed = constrain(speed, -255, 255);
+  if (speed != 0 && abs(speed) < MIN_PWM) speed = (speed > 0) ? MIN_PWM : -MIN_PWM;
+  analogWrite(a, speed > 0 ? speed : 0);
+  analogWrite(b, speed < 0 ? -speed : 0);
+}
+
+// l, r: speed -255..255 for the left / right side
+void drive(int l, int r) {
+  // NORMAL mode: the car is not allowed to move
+  if (!searchingEnabled) { l = 0; r = 0; }
+
+  setMotor(PIN_L1, PIN_L2, l * LEFT_SIGN);    // 2 left motors share channel A
+  setMotor(PIN_R1, PIN_R2, r * RIGHT_SIGN);   // 2 right motors share channel B
+}
+void stopMotors() { drive(0, 0); }
+
+// ====================== UDP ======================
+void goSearch() {
+  stopMotors();
+  state = ST_SEARCH;
+  searchRight = (lastSeenErr >= 0) ? true : false;   // spin toward the side where the target vanished
+  searchSpinning = false;
+  searchPhaseMs = millis();
+}
+
+void resetCar() {
+  stopMotors();
+  state = ST_SEARCH;
+  lastDetMs = 0;
+  vDet = false;
+  searchRight = SEARCH_SPIN_RIGHT;
+  searchSpinning = false;
+  sendMsg("RESET_OK");
+}
+
+void pollUdp() {
+  while (udp.parsePacket() > 0) {
+    char buf[64];
+    int n = udp.read(buf, sizeof(buf) - 1);
+    if (n <= 0) continue;
+    buf[n] = 0;
+    remoteIP = udp.remoteIP();
+    remotePort = udp.remotePort();
+
+    if (buf[0] == 'R') { resetCar(); continue; }
+    if (buf[0] == 'D') {
+      int d; float e, a;
+      if (sscanf(buf, "D,%d,%f,%f", &d, &e, &a) == 3) {
+        vDet = (d != 0); vErr = e; vArea = a;
+        lastRx = millis();
+        if (vDet) {
+          lastDetMs = millis();
+          lastSeenErr = e;
+        }
+      }
+    }
+  }
+}
+
+// ====================== WEBSOCKET ======================
+void onWebSocketEvent(AsyncWebSocket *s, AsyncWebSocketClient *c,
+                      AwsEventType type, void *arg, uint8_t *data, size_t len) {
+  if (type == WS_EVT_CONNECT) {
+    c->text(searchingEnabled ? "MODE:SEARCHING" : "MODE:NORMAL");
+  }
+  else if (type == WS_EVT_DATA) {
+    String msg;
+    for (size_t i = 0; i < len; i++) msg += (char)data[i];
+
+    if (msg == "SEARCHING")   searchingEnabled = true;
+    else if (msg == "NORMAL") searchingEnabled = false;
+
+    ws.textAll(searchingEnabled ? "MODE:SEARCHING" : "MODE:NORMAL");
+  }
+}
+
+// ====================== SEND STATUS ======================
+void sendStatus() {
+  if (!remotePort || millis() - lastStatusMs <= 500) return;
+  lastStatusMs = millis();
+  const char* names[] = {"SEARCH", "TRACK", "LOCKED"};
+  String s = "ST,";
+  s += searchingEnabled ? "SEARCHING," : "NORMAL,";
+  s += names[state];
+  s += ",err=" + String(vErr, 2);
+  s += ",area=" + String(vArea, 2);
+  udp.beginPacket(remoteIP, remotePort);
+  udp.print(s);
+  udp.endPacket();
+}
+
+// ====================== SETUP / LOOP ======================
+void setup() {
+  Serial.begin(115200);
+
+  int outs[] = {PIN_L1, PIN_L2, PIN_R1, PIN_R2};
+  for (int p : outs) pinMode(p, OUTPUT);
+  stopMotors();
+
+  // Warning only, no return so WiFi/UDP keep running
+  if (!LittleFS.begin(true)) Serial.println("LittleFS Mount Failed!");
+  else                       Serial.println("LittleFS Mounted Successfully!");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) { delay(400); Serial.print("."); }
+  Serial.println();
+  Serial.print("ESP32 IP: ");
+  Serial.println(WiFi.localIP());
+
+  // Connected: enable the local hostname + print the control page link
+  if (MDNS.begin("xebam")) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.println("Or open: http://xebam.local");
+  }
+  Serial.println("=================================");
+  Serial.print("CONTROL PAGE: http://");
+  Serial.println(WiFi.localIP());
+  Serial.println("=================================");
+
+  udp.begin(UDP_PORT);
+
+  // ---- WebSocket + Web server ----
+  ws.onEvent(onWebSocketEvent);
+  server.addHandler(&ws);
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (LittleFS.exists("/index.html"))
+      request->send(LittleFS, "/index.html", "text/html");
+    else
+      request->send(200, "text/plain", "index.html has not been uploaded to LittleFS");
+  });
+  server.begin();
+
+  Serial.println("Ready. Mode: NORMAL (stopped)");
+}
+
+void loop() {
+  ws.cleanupClients();
+  pollUdp();          // always receive UDP data from the computer
+  sendStatus();
+
+  // ================= NORMAL MODE =================
+  if (!searchingEnabled) {
+    stopMotors();
+    if (wasSearchingEnabled) {          // just switched from Searching to Normal
+      state = ST_SEARCH;
+      lastDetMs = 0;
+      vDet = false;
+      Serial.println("Car stopped!");
+    }
+    wasSearchingEnabled = false;
+    delay(5);
+    return;
+  }
+
+  // ================= SEARCHING MODE =================
+  if (!wasSearchingEnabled) {           // Searching was just turned on
+    state = ST_SEARCH;
+    lastDetMs = 0;
+    vDet = false;
+    searchRight = SEARCH_SPIN_RIGHT;
+    searchSpinning = false;
+    searchPhaseMs = millis();
+    wasSearchingEnabled = true;
+    Serial.println("Car started searching!");
+  }
+
+  unsigned long now = millis();
+  bool fresh = vDet && (now - lastRx < FRESH_MS);                 // currently have a valid target
+  bool seen  = (lastDetMs != 0) && (now - lastDetMs < LOST_GRACE_MS);
+
+  switch (state) {
+
+    // ---- TARGET NOT SEEN: spin in place in short pulses to search ----
+    case ST_SEARCH:
+      if (seen) {                     // target seen -> switch to tracking
+        stopMotors();
+        state = ST_TRACK;
+        sendMsg("TARGET_FOUND");
+        break;
+      }
+      if (SEARCH_SPIN) {
+        int t = searchRight ? SEARCH_SPEED : -SEARCH_SPEED;
+        if (searchSpinning) {
+          if (now - searchPhaseMs >= SEARCH_PULSE_MS) {
+            stopMotors();
+            searchSpinning = false;
+            searchPhaseMs = now;
+          }
+        } else if (now - searchPhaseMs >= SEARCH_PAUSE_MS) {
+          drive(t, -t);
+          searchSpinning = true;
+          searchPhaseMs = now;
+        }
+      } else {
+        stopMotors();
+      }
+      break;
+
+    // ---- TARGET SEEN: drive forward while steering by the offset ----
+    case ST_TRACK: {
+      if (!seen) {                    // target lost for too long -> go back to searching
+        goSearch();
+        break;
+      }
+      if (!fresh) { stopMotors(); break; }   // wait for a valid frame (safety: stop if signal is lost)
+
+      if (vArea >= STOP_AREA) {              // close enough -> stop
+        stopMotors();
+        state = ST_LOCKED;
+        sendMsg("TARGET_LOCKED");
+        break;
+      }
+
+      float ae = fabs(vErr);
+      if (ae > PIVOT_ERR) {                  // large offset -> pivot in place to realign
+        int t = (vErr > 0) ? TURN_SPEED : -TURN_SPEED;
+        drive(t, -t);
+      } else {                               // small offset -> drive forward while steering
+        int base = (vArea >= STOP_AREA * SLOW_AREA_RATIO) ? SLOW_SPEED : BASE_SPEED;
+        int steer = (ae > DEADBAND) ? (int)(vErr * STEER_GAIN) : 0;
+        // vErr > 0 (target on the right): left wheels faster, right wheels slower
+        drive(constrain(base + steer, 0, 255), constrain(base - steer, 0, 255));
+      }
+      break;
+    }
+
+    // ---- CLOSE ENOUGH: stand still, but follow again automatically when the target moves away ----
+    case ST_LOCKED:
+      if (!seen) {                    // target lost -> search again
+        goSearch();
+        break;
+      }
+      if (!fresh) { stopMotors(); break; }
+
+      if (vArea < RESUME_AREA) {      // target moved away -> follow again
+        state = ST_TRACK;
+        sendMsg("TARGET_MOVING");
+      } else if (fabs(vErr) > NEAR_TURN_ERR) {   // target shifted sideways -> rotate to follow
+        int t = (vErr > 0) ? TURN_SPEED : -TURN_SPEED;
+        drive(t, -t);
+      } else {
+        stopMotors();
+      }
+      break;
+  }
+}
